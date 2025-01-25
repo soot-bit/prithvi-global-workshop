@@ -1,20 +1,16 @@
 from __future__ import absolute_import
 
 import argparse
-import boto3
 import os
 import os.path as osp
-import time
 import time
 import yaml
 import logging
 
+from google.cloud import storage
 from lib.trainer import Trainer
 from lib.consts import SPLITS, DEFAULT_BASE_PATH
-from lib.utils import download_data, assumed_role_session, upload_model_artifacts
-
-ROLE_ARN = os.environ.get('ROLE_ARN')
-ROLE_NAME = os.environ.get('ROLE_NAME')
+from lib.utils import download_data_gcs, upload_model_artifacts_gcs
 
 logger = logging.getLogger(__name__)
 
@@ -25,42 +21,47 @@ def train():
 
     print(f"Environment variables: {os.environ}")
 
-    # download and prepare data for training:
+    # Download and prepare data for training
+    gcs_bucket = os.environ.get('GCS_BUCKET')
+    gcs_path = os.environ.get('GCS_PATH')
+
+    if not gcs_bucket or not gcs_path:
+        raise ValueError("GCS_BUCKET and GCS_PATH must be set in the environment variables.")
+
     for split in ['configs', 'models']:
-        download_data(os.environ.get('S3_URL'), split)
+        download_data_gcs(gcs_bucket, f"{gcs_path}/{split}")
 
     with open(config_file) as config:
         config = yaml.safe_load(config)
 
     for split in SPLITS:
         if config.get(split):
-            download_data(os.environ.get('S3_URL'), config[split]['relative_path'])
+            download_data_gcs(gcs_bucket, f"{gcs_path}/{config[split]['relative_path']}")
 
-    # init the logger before other steps
+    # Initialise the logger
     timestamp = time.strftime('%Y%m%d_%H%M%S', time.localtime())
     model_path = f"{DEFAULT_BASE_PATH}/code/{os.environ['VERSION']}/{os.environ['EVENT_TYPE']}/"
-    os.makedirs(model_path)
-    os.makedirs(f"{DEFAULT_BASE_PATH}/code/{config['predicted_mask_dir']}")
+    os.makedirs(model_path, exist_ok=True)
+    os.makedirs(f"{DEFAULT_BASE_PATH}/code/{config['predicted_mask_dir']}", exist_ok=True)
 
     log_file = osp.join(config['logging']['checkpoint_dir'], f'{timestamp}.log')
     logging.basicConfig(filename=log_file, level=logging.INFO)
 
+    # Initialise the trainer and start training
     trainer = Trainer(config_file)
     logger.info(trainer.model)
     trainer.train()
 
-    session = assumed_role_session()
-    s3_connection = session.resource('s3')
-    upload_model_artifacts(s3_connection, trainer.checkpoint)
+    # Upload model artifacts to GCS
+    upload_model_artifacts_gcs(gcs_bucket, trainer.checkpoint, f"{gcs_path}/models")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
-    # This is a way to pass additional arguments when running as a script
-    # and use sagemaker-containers defaults to set their values when not specified.
-    parser.add_argument("--train", type=str, default=os.environ.get("SM_CHANNEL_TRAIN"))
-    parser.add_argument("--validation", type=str, default=os.environ.get("SM_CHANNEL_VALIDATION"))
+    # Define arguments for training and validation paths
+    parser.add_argument("--train", type=str, default=os.environ.get("TRAIN_PATH"))
+    parser.add_argument("--validation", type=str, default=os.environ.get("VALIDATION_PATH"))
 
     args = parser.parse_args()
 

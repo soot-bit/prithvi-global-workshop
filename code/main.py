@@ -1,222 +1,147 @@
-import boto3
-import json
 import os
-import gc
-import geopandas as gpd
-import rasterio
 import time
-import torch
+import gc
 import yaml
-
-from fastapi import FastAPI, Request
-from fastapi import FastAPI, status, Request, Response
+import rasterio
+import torch
+from fastapi import FastAPI
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
+from google.cloud import storage
+from tempfile import NamedTemporaryFile
+from typing import List
+from inference import Infer  # Your custom inference class
+from utils import batch, merge_memory_files, post_process, subset_geojson, download_files
 
-from lib.downloader import DOWNLOAD_FOLDER, Downloader
-from lib.infer import Infer
-from lib.post_process import PostProcess
-from lib.trainer import Trainer
-from lib.consts import BUCKET_NAME, LAYERS
-from lib.utils import assumed_role_session
+# Environment variables
+CONFIG_FILENAME = os.environ.get("CONFIG_FILENAME")
+CHECKPOINT_FILE = os.environ.get("CHECKPOINT_FILE")
+BACKBONE_PATH = os.environ.get("BACKBONE_PATH")
+BUCKET_NAME = os.environ.get("GCS_BUCKET_NAME")
+LAYERS = os.environ.get("LAYERS", "").split(",")
 
-from rasterio.io import MemoryFile
-from rasterio.merge import merge
-from rio_cogeo.cogeo import cog_translate
-from rio_cogeo.profiles import cog_profiles
-
-from shapely.geometry import shape
-from skimage.morphology import disk, binary_closing
-
-from starlette.middleware.cors import CORSMiddleware
-
-
+# FastAPI instance
 app = FastAPI()
 
-CONFIG_FILENAME = os.environ.get('S3_CONFIG_FILENAME')
-CHECKPOINT_FILE = os.environ.get('CHECKPOINT_FILENAME')
-BACKBONE_PATH = os.environ.get('BACKBONE_FILENAME')
+# Global model dictionary
+MODELS = {}
 
-def download_from_s3(s3_path, download_path='config'):
-    session = assumed_role_session()
-    s3_connection = session.resource('s3')
-    bucket = s3_connection.Bucket(BUCKET_NAME)
-    filename = s3_path.split('/')[-1]
+
+# GCS Helper Functions
+def download_from_gcs(gcs_path, download_path="config"):
+    """Download a file from GCS to a local directory."""
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob_name = gcs_path.replace(f"gs://{BUCKET_NAME}/", "")
+    blob = bucket.blob(blob_name)
+    filename = blob_name.split("/")[-1]
     file_path = f"{download_path}/{filename}"
-    if not(os.path.exists(file_path)):
-        print('====================')
-        print(s3_path.replace(f's3://{BUCKET_NAME}/', ''), file_path)
+
+    if not os.path.exists(file_path):
         os.makedirs(download_path, exist_ok=True)
-        os.makedirs('predictions', exist_ok=True)
-        bucket.download_file(s3_path.replace(f's3://{BUCKET_NAME}/', ''), file_path)
+        blob.download_to_filename(file_path)
+
     return file_path
 
 
+def save_to_gcs(data, profile, transform, filename):
+    """Save a GeoTIFF to GCS."""
+    profile.update({
+        "driver": "GTiff",
+        "height": data.shape[0],
+        "width": data.shape[1],
+        "transform": transform,
+        "dtype": "float32",
+        "count": 1,
+    })
+
+    temp_file = NamedTemporaryFile(suffix=".tif", delete=False)
+    with rasterio.open(temp_file.name, "w", **profile) as raster:
+        raster.write(data, 1)
+
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob = bucket.blob(filename)
+    blob.upload_from_filename(temp_file.name)
+
+    temp_file.close()
+    os.unlink(temp_file.name)
+
+    return f"gs://{BUCKET_NAME}/{filename}"
+
+
+# Load Model
 def load_model():
-    config_file_path = download_from_s3(CONFIG_FILENAME)
-    model_weights_path = download_from_s3(CHECKPOINT_FILE, 'models')
-    backbone_path = download_from_s3(BACKBONE_PATH, 'models')
+    """Initialise the model and load configurations."""
+    config_file_path = download_from_gcs(CONFIG_FILENAME)
+    model_weights_path = download_from_gcs(CHECKPOINT_FILE, "models")
+    backbone_path = download_from_gcs(BACKBONE_PATH, "models")
+
     infer = Infer(config_file_path, model_weights_path, backbone_path)
+
     with open(config_file_path) as config:
         config = yaml.safe_load(config)
-    return {config['case']: infer}
 
-MODELS = load_model()
-
-
-def download_files(infer_date, layer, bounding_box):
-    downloader = Downloader(infer_date, layer)
-    return downloader.download_tiles(bounding_box)
+    return {config["case"]: infer}
 
 
-def save_cog(mosaic, profile, transform, filename):
-    profile.update(
-        {
-            "driver": "GTiff",
-            "height": mosaic.shape[0],
-            "width": mosaic.shape[1],
-            "transform": transform,
-            "dtype": 'float32',
-            "count": 1,
-        }
-    )
-    with rasterio.open(filename, 'w', **profile) as raster:
-        raster.write(mosaic, 1)
-    output_profile = cog_profiles.get('deflate')
-    output_profile.update(dict(BIGTIFF="IF_SAFER"))
-    output_profile.update(profile)
-
-    # Dataset Open option (see gdalwarp `-oo` option)
-    config = dict(
-        GDAL_NUM_THREADS="ALL_CPUS",
-        GDAL_TIFF_INTERNAL_MASK=True,
-        GDAL_TIFF_OVR_BLOCKSIZE="512",
-    )
-    with MemoryFile() as memory_file:
-        cog_translate(
-            filename,
-            memory_file.name,
-            output_profile,
-            config=config,
-            quiet=True,
-            in_memory=True,
-        )
-        connection = boto3.client('s3')
-        connection.upload_fileobj(memory_file, BUCKET_NAME, filename)
-
-    return f"s3://{BUCKET_NAME}/{filename}"
+@app.on_event("startup")
+async def startup_event():
+    """Initialise models on startup."""
+    global MODELS
+    MODELS = load_model()
 
 
-def post_process(detections, transform):
-    contours, shape = PostProcess.prepare_contours(detections)
-    detections = PostProcess.extract_shapes(detections, contours, transform, shape)
-    detections = PostProcess.remove_intersections(detections)
-    return PostProcess.convert_to_geojson(detections)
+@app.get("/")
+async def root():
+    """Root endpoint to check API health."""
+    return {"message": "API is running successfully."}
 
 
-def subset_geojson(geojson, bounding_box):
-    geom = [shape(i['geometry']) for i in geojson]
-    geom = gpd.GeoDataFrame({'geometry': geom})
-    bbox = {
-        "type": "Polygon",
-        "coordinates": [
-            [
-                [bounding_box[0], bounding_box[1]],
-                [bounding_box[2], bounding_box[1]],
-                [bounding_box[2], bounding_box[3]],
-                [bounding_box[0], bounding_box[3]],
-                [bounding_box[0], bounding_box[1]],
-            ]
-        ],
-    }
-    bbox = shape(bbox)
-    bbox = gpd.GeoDataFrame({'geometry': [bbox]})
-    return json.loads(geom.overlay(bbox, how='intersection').to_json())
-
-
-def batch(tiles, spacing=60):
-    length = len(tiles)
-    for tile in range(0, length, spacing):
-        yield tiles[tile : min(tile + spacing, length)]
-
-def infer(model_id, infer_date, bounding_box):
+@app.get("/infer/{model_id}")
+async def infer(model_id: str, infer_date: str, bounding_box: List[float]):
+    """Perform inference for the specified model."""
     if model_id not in MODELS:
-        response = {'statusCode': 422}
-        return JSONResponse(content=jsonable_encoder(response))
+        return JSONResponse(content=jsonable_encoder({"statusCode": 422}))
+
     inference = MODELS[model_id]
-    all_tiles = list()
-    geojson_list = list()
-    geojson = {'type': 'FeatureCollection', 'features': []}
+    all_tiles = []
+    geojson_list = []
+    geojson = {"type": "FeatureCollection", "features": []}
 
     for layer in LAYERS:
         tiles = download_files(infer_date, layer, bounding_box)
-        for tile in tiles:
-            tile_name = tile
-            if model_id == 'burn':
-                tile_name = tile_name.replace('.tif', '_scaled.tif')
-            all_tiles.append(tile_name)
+        all_tiles.extend(tiles)
 
     start_time = time.time()
-    mosaic = []
-    s3_link = ''
+    s3_link = None
+
     if all_tiles:
         try:
-            torch.cuda.synchronize()
-            results = list()
-            profiles = list()
-            with torch.no_grad():
-                for tiles in batch(all_tiles):
-                    batch_results, batch_profiles = inference.infer(tiles)
-                    results.extend(batch_results)
-                    profiles.extend(batch_profiles)
-            memory_files = list()
-            torch.cuda.empty_cache()
-            for index, profile in enumerate(profiles):
-                memfile = MemoryFile()
-                profile.update({
-                    'count': 1,
-                    'dtype': 'float32'
-                })
-                with memfile.open(**profile) as memoryfile:
-                    memoryfile.write(results[index], 1)
-                    print(index, results[index].min(), results[index].max())
-                memory_files.append(memfile.open())
+            results = []
+            profiles = []
 
-            mosaic, transform = merge(memory_files)
-            # for index in range(len(mosaic)):
-            #     mosaic[index] = binary_closing(mosaic[index], disk(6))
-            [memfile.close() for memfile in memory_files]
+            async with torch.no_grad():
+                for tile_batch in batch(all_tiles):
+                    res, prof = inference.infer(tile_batch)
+                    results.extend(res)
+                    profiles.extend(prof)
+
+            mosaic, transform = merge_memory_files(results, profiles)
             prediction_filename = f"predictions/{start_time}-predictions.tif"
-
-            s3_link = save_cog(mosaic[0], profile, transform, prediction_filename)
+            s3_link = save_to_gcs(mosaic[0], profiles[0], transform, prediction_filename)
 
             geojson = post_process(mosaic[0], transform)
-
-            for geometry in geojson:
-                updated_geometry = PostProcess.convert_geojson(geometry)
-                geojson_list.append(updated_geometry)
-            geojson = subset_geojson(geojson_list, bounding_box)
+            geojson = subset_geojson(geojson, bounding_box)
         except Exception as e:
-            print('!!! infer error', infer_date, model_id, bounding_box, e)
+            print(f"Inference Error: {e}")
             torch.cuda.empty_cache()
-        print("!!! Infer Time:", time.time() - start_time)
-    del inference
+
     gc.collect()
+    return {model_id: {"gcs_link": s3_link, "predictions": geojson}}
 
-    return {
-        model_id: {'s3_link': s3_link, 'predictions': geojson}
-    }
 
-@app.post('/invocations')
-async def infer_from_model(request: Request):
-    instances = await request.json()
-
-    model_id = instances['model_id']
-    infer_date = instances['date']
-    bounding_box = instances['bounding_box']
-    final_geojson = infer(model_id, infer_date, bounding_box)
-    return JSONResponse(content=jsonable_encoder(final_geojson))
-
-@app.get('/ping')
-async def ping(request: Request):
-    return { 'successCode': 200, 'message': 'pong'}
+# For Deployment on GCP Cloud Run
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)

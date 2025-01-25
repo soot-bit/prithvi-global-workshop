@@ -1,6 +1,7 @@
+# Core libraries
 pyyaml
 torch >= 2.0.0
-torchvision
+torchvision == 0.15.0  # Ensure this matches the version of torch
 xarray
 dask
 netCDF4
@@ -10,17 +11,12 @@ timm
 einops
 yacs
 tqdm
-fastapi
-gunicorn
-uvicorn[gunicorn]
-sagemaker-training
 morecantile
 opencv-python
 rio-cogeo
 shapely
 joblib
 boto3
-morecantile
 huggingface_hub
 geojson
 scikit-image
@@ -30,11 +26,20 @@ pydantic==1.10.11
 starlette
 pygeos
 
-
-# The following packages are required for preprocessing only
+# Preprocessing dependencies (if only needed for training, separate in a different file if not)
 rasterio
 rioxarray
 geopandas
 pandas
 matplotlib
 scipy
+
+# For GCP support (Optional but useful if you're using GCP Storage/AI)
+google-cloud-storage
+google-auth
+google-cloud-ai-platform
+
+# FastAPI, Gunicorn, and Uvicorn for model serving (only if needed for inference)
+fastapi
+gunicorn
+uvicorn[gunicorn]

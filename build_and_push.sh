@@ -1,23 +1,28 @@
-%%sh
-docker build . -f Dockerfile.inference --platform linux/amd64 -t prithvi_global_inference
+#!/bin/bash
 
-export ECR_URL="<account-number>.dkr.ecr.us-west-2.amazonaws.com"
+# Define the GCR URL
+export GCR_URL="gcr.io/my-colab-99752"
 
-aws ecr get-login-password --region us-west-2 | \
-  docker login --password-stdin --username AWS $ECR_URL
+# Function to build, tag, and push Docker images
+build_and_push() {
+  local dockerfile=$1
+  local image_name=$2
 
-docker tag prithvi_global_inference $ECR_URL/prithvi_global_inference:latest
+  # Build Docker image
+  docker build . -f $dockerfile --platform linux/amd64 -t $image_name
 
-docker push $ECR_URL/prithvi_global_inference:latest
+  # Authenticate Docker with GCR
+  gcloud auth configure-docker --quiet
 
+  # Tag the Docker image with GCR repository
+  docker tag $image_name $GCR_URL/$image_name:latest
 
-docker build . -f Dockerfile --platform linux/amd64 -t prithvi_global
+  # Push the Docker image to GCR
+  docker push $GCR_URL/$image_name:latest
+}
 
-export ECR_URL="<account-number>.dkr.ecr.us-west-2.amazonaws.com"
+# Build and push prithvi_global_inference image
+build_and_push "Dockerfile.inference" "prithvi_global_inference"
 
-aws ecr get-login-password --region us-west-2 | \
-  docker login --password-stdin --username AWS $ECR_URL
-
-docker tag prithvi_global $ECR_URL/prithvi_global:latest
-
-docker push $ECR_URL/prithvi_global:latest
+# Build and push prithvi_global image
+build_and_push "Dockerfile" "prithvi_global"
